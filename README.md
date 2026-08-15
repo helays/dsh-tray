@@ -33,10 +33,10 @@
 
 ```bat
 cd dsh-tray
-start-harness.bat          :: 第一次自动编译 exe, 之后直接启动托盘
+start-harness.bat          :: 每次从源码重新构建(图标+exe)并启动托盘
 ```
 
-或直接运行（无参即可）:
+或直接运行已构建产物（无参即可）:
 
 ```bat
 bin\DshTray.exe
@@ -76,13 +76,17 @@ DshTray.exe --help
 
 ## 🏗️ 从源码构建
 
+**只需双击 `start-harness.bat`** —— 它会自动从源码完成全部构建（渲染鲸鱼图标 → csc 编译 → 输出 `bin/DshTray.exe`），无需手动运行任何脚本。
+
+等效的手工命令（等价于 bat 内部做的事）:
 ```bat
 cd dsh-tray
-powershell -NoProfile -ExecutionPolicy Bypass -File build-icon.ps1    :: 渲染鲸鱼 .ico
-powershell -NoProfile -ExecutionPolicy Bypass -File build-exe.ps1     :: 编译含内嵌图标的 exe
+start-harness.bat
 ```
 
 产物：`bin/DshTray.exe`（自包含，含鲸鱼图标资源 + exe 文件图标）。
+
+> `start-harness.bat` 已将构建逻辑完全内联（通过 base64 内嵌一段 PowerShell，使用后自动清理临时文件），仓库不再依赖/包含任何 `.ps1` 构建脚本。
 
 ## 📁 目录结构
 
@@ -92,9 +96,7 @@ dsh-tray/
 ├─ src/DshTray.cs         # 托盘宿主 C# 源码
 ├─ assets/DeepSeekWhale.ico
 ├─ dsh-whale-path.txt     # 从官方 favicon 提取的鲸鱼 SVG path
-├─ build-icon.ps1         # SVG path -> .ico
-├─ build-exe.ps1          # csc 编译（/win32icon + /resource 嵌入图标）
-├─ start-harness.bat      # 双击入口：首次构建并启动
+├─ start-harness.bat      # 双击入口：一键从源码构建 + 启动
 ├─ docs/CHANGELOG.md
 ├─ LICENSE                # MIT
 └─ README.md

@@ -19,9 +19,10 @@
 
 ### Changed
 
-- `start-harness.bat` 精简为启动自包含 exe（不再传 `--icon`）。
+- **`start-harness.bat` 完全自足**：每次双击都从源码构建——内联渲染鲸鱼图标并 csc 编译 `bin/DshTray.exe`（构建逻辑经 base64 内嵌，不再依赖任何 `.ps1`，使用后自动清理临时文件）。
+- **移除** `build-icon.ps1`、`build-exe.ps1`（逻辑已并入 `start-harness.bat`）。
 - `DshTray.cs`：托盘图标优先从内嵌资源加载，`--icon` 作外部回退。
-- `build-exe.ps1`：加入 `/win32icon` + `/resource` 图标嵌入。
+- 新增 `--no-open` 参数：关闭「启动后自动打开浏览器」；`DshTray.cs` 自启成功后自动打开默认浏览器。
 
 ## [v0.1.0] - 2026-08-15 · 首个可用版本
 
