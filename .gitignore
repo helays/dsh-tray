@@ -3,10 +3,8 @@
 logs/
 
 # --- Build artifacts ---
-# 只保留交付物 exe, 忽略临时编译输出
-bin/*.log
-bin/csc.*.log
-bin/probe*
+# 编译产物不再入库：双击 start-harness.bat 每次自动从源码构建 bin/DshTray.exe
+bin/
 
 # --- OS / editor cruft ---
 Thumbs.db
