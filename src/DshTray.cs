@@ -4,6 +4,8 @@
 // 用 NotifyIcon 在系统托盘显示鲸鱼图标。启动时拉起 harness(Web GUI)。
 // 托盘菜单:
 //   - 双击 / "打开浏览器" : 打开 Web GUI
+//   - "重启 Harness"      : 停止旧实例并自启新实例
+//   - "检测更新"          : 对比已装与 npm 最新 @deepseek-ai/dsh 版本
 //   - "退出"               : 终止 harness 及其子进程, 然后退出自身
 //
 // 用法:
@@ -33,6 +35,7 @@ public static class Program
     static int _port = 3080;
     static string _script;     // 解析出的 bin.js 路径
     static bool _ownsHarness;  // 本进程是否自启了 harness(退出时才杀掉)
+    static Control _msgHost;   // 用于把检测结果回调到消息循环主线程的宿主
     static bool _noOpen;       // 为 true 时启动后不自动打开浏览器
 
     [STAThread]
@@ -97,6 +100,7 @@ public static class Program
 
             using (var form = new HiddenForm())
             {
+                _msgHost = form;
                 SetupTray(port);
 
                 // 自启服务成功后, 等网页就绪再自动打开默认浏览器(可用 --no-open 关闭)
@@ -223,6 +227,9 @@ public static class Program
         var start = new ToolStripMenuItem("重启 Harness");
         start.Click += (s, e) => Restart();
 
+        var checkUpd = new ToolStripMenuItem("检测更新");
+        checkUpd.Click += (s, e) => CheckUpdatesAsync();
+
         var sep = new ToolStripSeparator();
 
         var about = new ToolStripMenuItem("关于");
@@ -236,6 +243,7 @@ public static class Program
         menu.Items.Add(_statusItem);
         menu.Items.Add(open);
         menu.Items.Add(start);
+        menu.Items.Add(checkUpd);
         menu.Items.Add(sep);
         menu.Items.Add(about);
         menu.Items.Add(quit);
@@ -288,6 +296,140 @@ public static class Program
     {
         try { Process.Start(new ProcessStartInfo(_url) { UseShellExecute = true }); }
         catch (Exception ex) { MessageBox.Show("打不开浏览器: " + ex.Message, "DshTray", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+    }
+
+    // “检测更新”: 在后台对比已装的 @deepseek-ai/dsh 与 npm 上的最新版本。
+    // 由于在消息循环里, 网络等待放到后台线程, 完成后用 Invoke 回主线程弹窗。
+    static void CheckUpdatesAsync()
+    {
+        string localDir = ResolveDshPackageDir();   // 已装 dsh 包目录(可空)
+        var worker = new Thread(() =>
+        {
+            string latest = null;
+            string err = null;
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "npm",
+                    Arguments = "view @deepseek-ai/dsh version",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    string stdout = p.StandardOutput.ReadToEnd().Trim();
+                    string stderr = p.StandardError.ReadToEnd().Trim();
+                    p.WaitForExit(30000);
+                    if (stdout.Length > 0) latest = stdout.Trim().Split('\n')[0].Trim();
+                    else if (stderr.Length > 0) err = stderr.Trim();
+                }
+            }
+            catch (Exception ex) { err = ex.Message; }
+
+            string installed = null;
+            if (localDir != null)
+            {
+                try
+                {
+                    var pj = Path.Combine(localDir, "package.json");
+                    if (File.Exists(pj))
+                    {
+                        foreach (var line in File.ReadAllLines(pj))
+                        {
+                            var t = line.Trim();
+                            if (t.StartsWith("\"version\"")) { installed = t.Substring(t.IndexOf(':') + 1).Trim().Trim(',', '"', ' '); break; }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            var result = BuildUpdateMessage(latest, installed, err);
+            if (_msgHost != null)
+            {
+                try { _msgHost.Invoke((Action)(() => MessageBox.Show(result.Item1, result.Item2, MessageBoxButtons.OK, MessageBoxIcon.Information))); }
+                catch { }
+            }
+        });
+        worker.IsBackground = true;
+        worker.Start();
+    }
+
+    // 根据检测结果拼装提示内容。返回 (message, title)。
+    static Tuple<string, string> BuildUpdateMessage(string latest, string installed, string err)
+    {
+        if (latest == null)
+            return Tuple.Create("无法获取最新版本。\n\n" +
+                (err != null ? err : "请检查网络是否可用。"), "检测更新 - 失败");
+        if (installed == null)
+            return Tuple.Create("最新版本: " + latest + "\n本机已装版本未知(未定位到本地 dsh 包)。",
+                "检测更新");
+        int cmp = CompareVersions(installed, latest);
+        if (cmp < 0)
+            return Tuple.Create("发现新版本\n\n  本机版本: " + installed + "\n  最新版本: " + latest +
+                "\n\n更新命令:\n  npm install -g @deepseek-ai/dsh\n然后重启 Harness 使之生效。",
+                "检测更新 - 有新版本");
+        if (cmp == 0)
+            return Tuple.Create("已是最新版本: " + installed, "检测更新");
+        return Tuple.Create("本机版本 " + installed + " 高于最新 " + latest + "(可能是预发布版)。", "检测更新");
+    }
+
+    // 简单版本号比较 (x.y.z), 整数逐段比较。
+    static int CompareVersions(string a, string b)
+    {
+        var pa = ParseVersion(a);
+        var pb = ParseVersion(b);
+        int n = Math.Min(pa.Length, pb.Length);
+        for (int i = 0; i < n; i++)
+        {
+            if (pa[i] != pb[i]) return pa[i].CompareTo(pb[i]);
+        }
+        return pa.Length.CompareTo(pb.Length);
+    }
+
+    static int[] ParseVersion(string v)
+    {
+        // 去掉 pre-release 后缀等, 仅取前段数字
+        var parts = v.Split('-')[0].Split('.');
+        var arr = new int[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+        {
+            int x;
+            int.TryParse(parts[i], out x);
+            arr[i] = x;
+        }
+        return arr;
+    }
+
+    // 定位已装 @deepseek-ai/dsh 的包目录(含 package.json)。
+    static string ResolveDshPackageDir()
+    {
+        // 优先用已解析的 bin.js(它在 node_modules/@deepseek-ai/dsh/lib/bin.js)
+        if (!string.IsNullOrEmpty(_script))
+        {
+            var dir = Path.GetDirectoryName(Path.GetDirectoryName(_script)); // .../dsh
+            if (dir != null && File.Exists(Path.Combine(dir, "package.json"))) return dir;
+        }
+        // 否则在 npx 缓存里找
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string[] roots = {
+            Path.Combine(local, "npm-cache", "_npx"),
+            Path.Combine(home, "AppData", "Local", "npm-cache", "_npx")
+        };
+        foreach (var root in roots)
+        {
+            if (!Directory.Exists(root)) continue;
+            foreach (var dir in Directory.GetDirectories(root))
+            {
+                var cand = Path.Combine(dir, @"node_modules\@deepseek-ai\dsh");
+                if (File.Exists(Path.Combine(cand, "package.json"))) return cand;
+            }
+        }
+        return null;
     }
 
     static void Restart()
