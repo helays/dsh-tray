@@ -33,6 +33,7 @@ public static class Program
     static int _port = 3080;
     static string _script;     // 解析出的 bin.js 路径
     static bool _ownsHarness;  // 本进程是否自启了 harness(退出时才杀掉)
+    static bool _noOpen;       // 为 true 时启动后不自动打开浏览器
 
     [STAThread]
     public static int Main(string[] args)
@@ -49,6 +50,7 @@ public static class Program
                 case "--bin":    if (i + 1 < args.Length) { bin = args[++i]; } break;
                 case "--icon":   if (i + 1 < args.Length) { icon = args[++i]; } break;
                 case "--url":    if (i + 1 < args.Length) { _url = args[++i]; } break;
+                case "--no-open": _noOpen = true; break;
                 case "--help":
                 case "-h":
                     Console.WriteLine("DshTray: DeepSeek Harness tray host");
@@ -56,6 +58,7 @@ public static class Program
                     Console.WriteLine("  --bin <path>   dsh lib/bin.js launcher");
                     Console.WriteLine("  --icon <path>  tray icon .ico/.png");
                     Console.WriteLine("  --url <url>    browser URL");
+                    Console.WriteLine("  --no-open      do not auto-open the browser on start");
                     return 0;
             }
         }
@@ -95,10 +98,43 @@ public static class Program
             using (var form = new HiddenForm())
             {
                 SetupTray(port);
+
+                // 自启服务成功后, 等网页就绪再自动打开默认浏览器(可用 --no-open 关闭)
+                if (_ownsHarness && !_noOpen)
+                    AutoOpenBrowserAsync();
+
                 Application.Run(form);   // forks off a message loop; _tray keeps it alive
             }
         }
+
         return 0;
+    }
+
+    // 后台等待 URL 连通后打开默认浏览器(避免 node 尚未 bind 就打开导致空白页)
+    static void AutoOpenBrowserAsync()
+    {
+        var worker = new Thread(() =>
+        {
+            for (int i = 0; i < 20; i++)   // 最多约 10 秒
+            {
+                try
+                {
+                    using (var tcp = new System.Net.Sockets.TcpClient())
+                    {
+                        var ar = tcp.BeginConnect("127.0.0.1", _port, null, null);
+                        if (ar.AsyncWaitHandle.WaitOne(500) && tcp.Connected)
+                        {
+                            OpenBrowser();
+                            return;
+                        }
+                    }
+                }
+                catch { }
+                Thread.Sleep(500);
+            }
+        });
+        worker.IsBackground = true;
+        worker.Start();
     }
 
     // 命令行参数引用: 用于构造 ProcessStartInfo.Arguments
