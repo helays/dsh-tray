@@ -1,0 +1,16 @@
+# --- Logs ---
+*.log
+logs/
+
+# --- Build artifacts ---
+# 只保留交付物 exe, 忽略临时编译输出
+bin/*.log
+bin/csc.*.log
+bin/probe*
+
+# --- OS / editor cruft ---
+Thumbs.db
+.DS_Store
+*.swp
+.idea/
+.vscode/
