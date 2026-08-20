@@ -35,7 +35,7 @@ public static class Program
     static int _port = 3080;
     static string _script;     // 解析出的 bin.js 路径
     static bool _ownsHarness;  // 本进程是否自启了 harness(退出时才杀掉)
-    static Control _msgHost;   // 用于把检测结果回调到消息循环主线程的宿主
+    static SynchronizationContext _uiSync; // 主线程同步上下文, 用于跨线程弹窗
     static bool _noOpen;       // 为 true 时启动后不自动打开浏览器
 
     [STAThread]
@@ -100,7 +100,7 @@ public static class Program
 
             using (var form = new HiddenForm())
             {
-                _msgHost = form;
+                _uiSync = SynchronizationContext.Current;   // 捕获主线程同步上下文
                 SetupTray(port);
 
                 // 自启服务成功后, 等网页就绪再自动打开默认浏览器(可用 --no-open 关闭)
@@ -190,7 +190,11 @@ public static class Program
 
     static string ResolveDshBin()
     {
-        // 遍历 npx 缓存目录
+        // 1) 优先用 npm 全局安装目录(npm install -g 的目标), 升级后能立即用新版
+        string globalCandidate = Path.Combine(GetGlobalPrefix(), @"node_modules\@deepseek-ai\dsh\lib\bin.js");
+        if (File.Exists(globalCandidate)) return globalCandidate;
+
+        // 2) 其次遍历 npx 缓存目录
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         string[] roots = {
@@ -207,6 +211,33 @@ public static class Program
             }
         }
         return null;
+    }
+
+    // 获取 npm 全局前缀目录(如 C:\Users\<user>\AppData\Roaming\npm)
+    static string GetGlobalPrefix()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "npm",
+                Arguments = "prefix -g",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using (var p = Process.Start(psi))
+            {
+                string outp = p.StandardOutput.ReadToEnd().Trim();
+                p.WaitForExit(5000);
+                if (outp.Length > 0) return outp.Split('\n')[0].Trim();
+            }
+        }
+        catch { }
+        // 兜底: 常见默认路径
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return Path.Combine(home, "AppData", "Roaming", "npm");
     }
 
     static void SetupTray(int port)
@@ -299,9 +330,12 @@ public static class Program
     }
 
     // “检测更新”: 在后台对比已装的 @deepseek-ai/dsh 与 npm 上的最新版本。
-    // 由于在消息循环里, 网络等待放到后台线程, 完成后用 Invoke 回主线程弹窗。
+    // 网络等待放后台线程; 结果通过主线程同步上下文回 UI 弹窗, 不阻塞托盘。
     static void CheckUpdatesAsync()
     {
+        // 即时反馈: 先在托盘弹气泡表示“已开始”, 避免看起来没反应
+        ShowBalloon("检测更新", "正在查询 @deepseek-ai/dsh 最新版本，请稍候…", 1500);
+
         string localDir = ResolveDshPackageDir();   // 已装 dsh 包目录(可空)
         var worker = new Thread(() =>
         {
@@ -348,72 +382,235 @@ public static class Program
             }
 
             var result = BuildUpdateMessage(latest, installed, err);
-            if (_msgHost != null)
+            // 通过主线程同步上下文回 UI 线程弹窗; 若不可用则退化为托盘气泡兜底
+            if (_uiSync != null)
             {
-                try { _msgHost.Invoke((Action)(() => MessageBox.Show(result.Item1, result.Item2, MessageBoxButtons.OK, MessageBoxIcon.Information))); }
+                try
+                {
+                    _uiSync.Post(_ => ShowUpdateResult(result.Item1, result.Item2, result.Item3), null);
+                    return;
+                }
                 catch { }
+            }
+            ShowBalloon(result.Item2, result.Item1, 5000);
+        });
+        worker.IsBackground = true;
+        worker.Start();
+    }
+
+    // 在 UI 线程展示检测结果; 若有新版可选, 弹“是/否”确认后触发自动升级
+    static void ShowUpdateResult(string msg, string title, bool hasUpdate)
+    {
+        if (!hasUpdate)
+        {
+            MessageBox.Show(msg, title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        var choice = MessageBox.Show(msg + "\n\n是否立即自动升级？",
+            title, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (choice == DialogResult.Yes) UpgradeAsync();
+    }
+
+    // 自动升级: 后台执行 npm install -g @deepseek-ai/dsh, 完成后重启 harness 使新版本生效
+    static void UpgradeAsync()
+    {
+        ShowBalloon("检测更新", "正在升级 @deepseek-ai/dsh，请稍候…", 2000);
+        var worker = new Thread(() =>
+        {
+            string err = null;
+            bool ok = false;
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "npm",
+                    Arguments = "install -g @deepseek-ai/dsh",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    string stdout = p.StandardOutput.ReadToEnd().Trim();
+                    string stderr = p.StandardError.ReadToEnd().Trim();
+                    p.WaitForExit(60000);
+                    ok = p.ExitCode == 0;
+                    if (!ok)
+                        err = (stderr.Length > 0 ? stderr : stdout);
+                    else if (stdout.Length > 0 && stdout.IndexOf("added", StringComparison.OrdinalIgnoreCase) >= 0)
+                    { /* 正常安装 */ }
+                }
+            }
+            catch (Exception ex) { err = ex.Message; }
+
+            if (ok)
+            {
+                // 升级成功后重启 harness, 让新版本生效
+                if (_uiSync != null)
+                {
+                    try
+                    {
+                        _uiSync.Post(_ =>
+                        {
+                            try { Restart(); } catch { }
+                            MessageBox.Show("升级完成，Harness 已用新版本重启。", "检测更新",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }, null);
+                        return;
+                    }
+                    catch { }
+                }
+                ShowBalloon("检测更新", "升级完成，Harness 已用新版本重启。", 5000);
+            }
+            else
+            {
+                string em = (err != null ? err : "");
+                MessageBox.Show("升级失败。\n\nnpm install -g @deepseek-ai/dsh\n\n" +
+                    (em.Length > 300 ? em.Substring(0, 300) : em), "检测更新",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         });
         worker.IsBackground = true;
         worker.Start();
     }
 
-    // 根据检测结果拼装提示内容。返回 (message, title)。
-    static Tuple<string, string> BuildUpdateMessage(string latest, string installed, string err)
+    // 兜底/即时反馈: 托盘气泡(不依赖 UI 线程 Invoke, 托盘应用更合适)
+    static void ShowBalloon(string title, string text, int timeout)
+    {
+        if (_tray == null) return;
+        try
+        {
+            _tray.BalloonTipTitle = title;
+            _tray.BalloonTipText = text;
+            _tray.ShowBalloonTip(timeout);
+        }
+        catch { }
+    }
+
+    // 在 UI 线程弹消息框(gui 线程由 Post 保证)
+    static void ShowMessageBox(string msg, string title)
+    {
+        MessageBox.Show(msg, title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    // 根据检测结果拼装提示内容。返回 (message, title, hasUpdate)。
+    // latest = npm view 的原始输出(registry 最新版), installed = 本机已装版本。
+    static Tuple<string, string, bool> BuildUpdateMessage(string latest, string installed, string err)
     {
         if (latest == null)
-            return Tuple.Create("无法获取最新版本。\n\n" +
-                (err != null ? err : "请检查网络是否可用。"), "检测更新 - 失败");
+            return Tuple.Create("无法获取 registry 最新版本。\n\n命令: npm view @deepseek-ai/dsh version\n\n" +
+                (err != null ? "错误输出:\n" + err : "请检查网络是否可用。"), "检测更新 - 失败", false);
         if (installed == null)
-            return Tuple.Create("最新版本: " + latest + "\n本机已装版本未知(未定位到本地 dsh 包)。",
-                "检测更新");
+            return Tuple.Create("registry 最新版本: " + latest + "\n本机已装版本: 未知(未定位到本地 dsh 包)。",
+                "检测更新", false);
         int cmp = CompareVersions(installed, latest);
         if (cmp < 0)
-            return Tuple.Create("发现新版本\n\n  本机版本: " + installed + "\n  最新版本: " + latest +
-                "\n\n更新命令:\n  npm install -g @deepseek-ai/dsh\n然后重启 Harness 使之生效。",
-                "检测更新 - 有新版本");
+            return Tuple.Create("发现新版本!\n\n  registry 最新版本: " + latest +
+                "   (npm view 输出)\n  本机已装版本:     " + installed +
+                "\n\n点击“是”将自动执行升级并重启 Harness。",
+                "检测更新 - 有新版本", true);
         if (cmp == 0)
-            return Tuple.Create("已是最新版本: " + installed, "检测更新");
-        return Tuple.Create("本机版本 " + installed + " 高于最新 " + latest + "(可能是预发布版)。", "检测更新");
+            return Tuple.Create("registry 最新版本: " + latest +
+                "   (npm view 输出)\n本机已装版本:     " + installed + "\n\n已是最新版本。",
+                "检测更新", false);
+        return Tuple.Create("registry 最新版本: " + latest +
+            "\n本机已装版本:     " + installed + "\n\n本机版本高于 registry 最新(可能是预发布版)。", "检测更新", false);
     }
 
-    // 简单版本号比较 (x.y.z), 整数逐段比较。
+    // 完整 semver 比较。返回 <0 表示 a<b, ==0 表示相等, >0 表示 a>b。
+    // 支持 pre-release: 0.1.0-rc.6 < 0.1.0-rc.7 < 0.1.0(< 正式版)。
     static int CompareVersions(string a, string b)
     {
-        var pa = ParseVersion(a);
-        var pb = ParseVersion(b);
-        int n = Math.Min(pa.Length, pb.Length);
-        for (int i = 0; i < n; i++)
-        {
-            if (pa[i] != pb[i]) return pa[i].CompareTo(pb[i]);
-        }
-        return pa.Length.CompareTo(pb.Length);
+        var pa = ParseVersionParts(a);
+        var pb = ParseVersionParts(b);
+
+        // 1) 先比较主版本号(major.minor.patch...)
+        int core = CompareCore(pa.Core, pb.Core);
+        if (core != 0) return core;
+
+        // 2) 主版本相等则比较 pre-release
+        return ComparePrerelease(pa.Pre, pb.Pre);
     }
 
-    static int[] ParseVersion(string v)
+    struct VersionParts { public Version Core; public string[] Pre; }
+
+    static VersionParts ParseVersionParts(string v)
     {
-        // 去掉 pre-release 后缀等, 仅取前段数字
-        var parts = v.Split('-')[0].Split('.');
-        var arr = new int[parts.Length];
-        for (int i = 0; i < parts.Length; i++)
+        var p = new VersionParts();
+        string core = v;
+        string pre = null;
+        int dash = v.IndexOf('-');
+        if (dash >= 0)
         {
-            int x;
-            int.TryParse(parts[i], out x);
-            arr[i] = x;
+            core = v.Substring(0, dash);
+            pre = v.Substring(dash + 1);
         }
-        return arr;
+        Version cv;
+        if (!Version.TryParse(core.TrimEnd('.'), out cv)) cv = new Version(0, 0, 0);
+        p.Core = cv;
+        if (!string.IsNullOrEmpty(pre)) p.Pre = pre.Split('.');
+        else p.Pre = null;   // null 表示无 pre-release(即正式版)
+        return p;
+    }
+
+    static int CompareCore(Version a, Version b)
+    {
+        // 逐段比较 major.minor.build.revision, 缺失按 0 处理
+        int[] aa = { Math.Max(0, a.Major), Math.Max(0, a.Minor), Math.Max(0, a.Build), Math.Max(0, a.Revision) };
+        int[] bb = { Math.Max(0, b.Major), Math.Max(0, b.Minor), Math.Max(0, b.Build), Math.Max(0, b.Revision) };
+        for (int i = 0; i < 4; i++)
+        {
+            if (aa[i] != bb[i]) return aa[i].CompareTo(bb[i]);
+        }
+        return 0;
+    }
+
+    // semver pre-release 比较: 无 pre > 有 pre; 逐段比较, 数字段按数值、字母段按字典序, 数字段 < 字母段。
+    static int ComparePrerelease(string[] a, string[] b)
+    {
+        bool aPre = a != null;
+        bool bPre = b != null;
+        if (!aPre && !bPre) return 0;
+        if (!aPre) return 1;   // a 是正式版 > b(pre)
+        if (!bPre) return -1;  // a(pre) < b 正式版
+
+        int n = Math.Min(a.Length, b.Length);
+        for (int i = 0; i < n; i++)
+        {
+            int r = CompareIdentifier(a[i], b[i]);
+            if (r != 0) return r;
+        }
+        // 前缀相同时, 更长的更大
+        return a.Length.CompareTo(b.Length);
+    }
+
+    // semver 单个 pre-release 标识符比较
+    static int CompareIdentifier(string x, string y)
+    {
+        int xi, yi;
+        bool xnum = int.TryParse(x, out xi);
+        bool ynum = int.TryParse(y, out yi);
+        if (xnum && ynum) return xi.CompareTo(yi);
+        if (xnum) return -1;   // 数字段 < 字母段
+        if (ynum) return 1;
+        return string.CompareOrdinal(x, y);
     }
 
     // 定位已装 @deepseek-ai/dsh 的包目录(含 package.json)。
     static string ResolveDshPackageDir()
     {
-        // 优先用已解析的 bin.js(它在 node_modules/@deepseek-ai/dsh/lib/bin.js)
+        // 1) 优先 npm 全局安装目录(与 ResolveDshBin 保持一致, 升级后读到此为最先)
+        string global = Path.Combine(GetGlobalPrefix(), @"node_modules\@deepseek-ai\dsh");
+        if (File.Exists(Path.Combine(global, "package.json"))) return global;
+
+        // 2) 其次用已解析的 bin.js(它在 node_modules/@deepseek-ai/dsh/lib/bin.js)
         if (!string.IsNullOrEmpty(_script))
         {
             var dir = Path.GetDirectoryName(Path.GetDirectoryName(_script)); // .../dsh
             if (dir != null && File.Exists(Path.Combine(dir, "package.json"))) return dir;
         }
-        // 否则在 npx 缓存里找
+        // 3) 最后在 npx 缓存里找
         string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         string[] roots = {
