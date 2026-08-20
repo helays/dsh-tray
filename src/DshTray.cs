@@ -15,6 +15,7 @@
 // 注意: 使用了 WinForms。通过 Add-Type 编译为无窗口(system-tray only)程序。
 // ============================================================================
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -144,6 +145,25 @@ public static class Program
     // 命令行参数引用: 用于构造 ProcessStartInfo.Arguments
     static string Q(string s) { return s.IndexOf(' ') < 0 ? s : "\"" + s + "\""; }
 
+    // 从子进程的 PATH 中剔除 Python 的 nodejs_wheel(Scripts) 目录, 防止其 npm/node 抢占,
+    // 确保 npm 脚本内部再调用 node 时也落到真实的系统 Node。
+    static void ResetProcessEnv(ProcessStartInfo psi)
+    {
+        try
+        {
+            string path = psi.Environment["Path"];
+            var parts = new List<string>();
+            foreach (var dir in path.Split(';'))
+            {
+                if (!string.IsNullOrWhiteSpace(dir) &&
+                    dir.IndexOf("Python", StringComparison.OrdinalIgnoreCase) < 0)
+                    parts.Add(dir);
+            }
+            psi.Environment["Path"] = string.Join(";", parts);
+        }
+        catch { }
+    }
+
     static Process StartHarness(string bin, int port)
     {
         // 定位 dsh 的 bin.js; --bin 优先, 否则在 npx 缓存里找
@@ -213,14 +233,71 @@ public static class Program
         return null;
     }
 
-    // 获取 npm 全局前缀目录(如 C:\Users\<user>\AppData\Roaming\npm)
+    // 获取 npm 全局前缀目录(如 C:\Users\<user>\AppData\Roaming\npm)。
+    // 注意: 不能直接依赖 `npm prefix -g` —— PATH 可能被 Python 的 nodejs_wheel
+    // (DeepSeek Harness 运行时自带) 接管, 导致返回 Harness 自身用的目录而非系统全局。
+    // 因此在 Windows 上优先确定性地采用 `%APPDATA%\npm`(系统 npmrc 默认 prefix)。
     static string GetGlobalPrefix()
     {
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string appdataNpm = Path.Combine(home, "AppData", "Roaming", "npm");
+
+        // 1) 优先: 系统 npm 全局根若确实装有 dsh 包, 直接用它(不受 PATH 污染)
+        if (File.Exists(Path.Combine(appdataNpm, "node_modules", "@deepseek-ai", "dsh", "package.json")))
+            return appdataNpm;
+
+        // 2) 其次: `%APPDATA%\npm` 目录存在也优先(标准全局根; 未装 dsh 会退回 npx 缓存)
+        if (Directory.Exists(appdataNpm))
+            return appdataNpm;
+
+        // 3) 回退: 动态解析。用解析出的系统全局 npm.cmd 以减小 PATH 污染风险
+        {
+            string prefix = TryNpmPrefix(ResolveNpmCmd());
+            if (prefix != null) return prefix;
+        }
+
+        // 4) 兜底: 常见默认路径
+        return appdataNpm;
+    }
+
+    // 定位系统全局 npm CLI(cmd)。关键危险: 当前 PATH 可能被 Python 的 nodejs_wheel
+    // (DeepSeek Harness 运行时自带) 提供的 npm.exe 接管, 其 global prefix 指向
+    // site-packages\nodejs_wheel, 导致 `npm install -g` 装错位置。因此显式回退到
+    // 真实 Node 所在目录的 npm.cmd, 并配合 --prefix 强制写往系统全局目录。
+    static string ResolveNpmCmd()
+    {
+        // 1) 优先: 与真实 node.exe 相邻的系统 npm.cmd
+        foreach (string root in new[] {
+            Environment.GetEnvironmentVariable("ProgramFiles") ?? "",
+            Environment.GetEnvironmentVariable("ProgramW6432") ?? ""
+        })
+        {
+            string npm = Path.Combine(root, "nodejs", "npm.cmd");
+            if (File.Exists(npm)) return npm;
+        }
+
+        // 2) 次选: 从 PATH 找首个非 Python 的 npm.cmd(避开 nodejs_wheel)
+        foreach (string dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
+        {
+            if (string.IsNullOrWhiteSpace(dir)) continue;
+            if (dir.IndexOf("Python", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+            string npm = Path.Combine(dir.Trim('"'), "npm.cmd");
+            if (File.Exists(npm)) return npm;
+        }
+
+        // 3) 兜底: 裸 npm(由 PATH 决定)
+        return "npm";
+    }
+
+    static string TryNpmPrefix(string file)
+    {
+        bool isBare = (file == "npm");
+        if (!isBare && !File.Exists(file)) return null;
         try
         {
             var psi = new ProcessStartInfo
             {
-                FileName = "npm",
+                FileName = file,
                 Arguments = "prefix -g",
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -235,9 +312,7 @@ public static class Program
             }
         }
         catch { }
-        // 兜底: 常见默认路径
-        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        return Path.Combine(home, "AppData", "Roaming", "npm");
+        return null;
     }
 
     static void SetupTray(int port)
@@ -343,15 +418,17 @@ public static class Program
             string err = null;
             try
             {
+                string realNpm = ResolveNpmCmd();   // 避开 nodejs_wheel 的 npm
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "npm",
+                    FileName = realNpm,
                     Arguments = "view @deepseek-ai/dsh version",
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
                 };
+                ResetProcessEnv(psi);   // 剔除 nodejs_wheel 对 PATH 的污染
                 using (var p = Process.Start(psi))
                 {
                     string stdout = p.StandardOutput.ReadToEnd().Trim();
@@ -412,24 +489,33 @@ public static class Program
     }
 
     // 自动升级: 后台执行 npm install -g @deepseek-ai/dsh, 完成后重启 harness 使新版本生效
+    // 升级前先停掉占用 _port 的 dsh web 服务(无论是否本托盘自启), 释放文件锁以便覆盖安装。
     static void UpgradeAsync()
     {
         ShowBalloon("检测更新", "正在升级 @deepseek-ai/dsh，请稍候…", 2000);
+        string realNpm = ResolveNpmCmd();              // 避开 nodejs_wheel 的 npm
+        string globalPrefix = GetGlobalPrefix();       // 强制安装到系统全局目录
+        var psi = new ProcessStartInfo
+        {
+            FileName = realNpm,
+            Arguments = Q("install") + " -g @deepseek-ai/dsh --prefix " + Q(globalPrefix),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        ResetProcessEnv(psi);   // 清掉 nodejs_wheel 对 PATH 的污染, 让子进程仍可信解析 npm
         var worker = new Thread(() =>
         {
             string err = null;
             bool ok = false;
+
+            // 1) 升级前停掉 dsh web 服务, 释放包目录文件锁
+            int wasPort = _port;
+            KillPortOwner(wasPort);
+
             try
             {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = "npm",
-                    Arguments = "install -g @deepseek-ai/dsh",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
                 using (var p = Process.Start(psi))
                 {
                     string stdout = p.StandardOutput.ReadToEnd().Trim();
@@ -444,32 +530,42 @@ public static class Program
             }
             catch (Exception ex) { err = ex.Message; }
 
-            if (ok)
+            if (!ok)
             {
-                // 升级成功后重启 harness, 让新版本生效
-                if (_uiSync != null)
+                // 升级失败: 若已停过服务则重启回老版本
+                _uiSync.Post(_ =>
                 {
-                    try
-                    {
-                        _uiSync.Post(_ =>
-                        {
-                            try { Restart(); } catch { }
-                            MessageBox.Show("升级完成，Harness 已用新版本重启。", "检测更新",
-                                MessageBoxButtons.OK, MessageBoxIcon.Information);
-                        }, null);
-                        return;
-                    }
-                    catch { }
-                }
-                ShowBalloon("检测更新", "升级完成，Harness 已用新版本重启。", 5000);
+                    try { StartHarness(null, wasPort); } catch { }
+                    string em = (err != null ? err : "");
+                    MessageBox.Show("升级失败。\n\nnpm install -g @deepseek-ai/dsh\n\n" +
+                        (em.Length > 300 ? em.Substring(0, 300) : em), "检测更新",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }, null);
+                return;
             }
-            else
+
+            // 2) 升级成功, 重启 harness(总是自启, 接管模式也在升级后转为自启)
+            if (_uiSync != null)
             {
-                string em = (err != null ? err : "");
-                MessageBox.Show("升级失败。\n\nnpm install -g @deepseek-ai/dsh\n\n" +
-                    (em.Length > 300 ? em.Substring(0, 300) : em), "检测更新",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                try
+                {
+                    _uiSync.Post(_ =>
+                    {
+                        try
+                        {
+                            _harness = StartHarness(null, wasPort);
+                            _ownsHarness = _harness != null;
+                        }
+                        catch { }
+                        MessageBox.Show("升级完成，Harness 已用新版本重启。", "检测更新",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }, null);
+                    return;
+                }
+                catch { }
             }
+            try { _harness = StartHarness(null, wasPort); _ownsHarness = _harness != null; } catch { }
+            ShowBalloon("检测更新", "升级完成，Harness 已用新版本重启。", 5000);
         });
         worker.IsBackground = true;
         worker.Start();
@@ -680,6 +776,76 @@ public static class Program
         }
         catch { }
         try { if (!_harness.HasExited) _harness.Kill(); } catch { }
+    }
+
+    // 按端口杀掉占用该端口的进程(含进程树)。升级前必须停掉 dsh web 服务,
+    // 释放文件锁以便 npm 覆盖安装; 无论该服务是否由本托盘自启都要停。
+    static void KillPortOwner(int port)
+    {
+        // 1) 优先杀掉本托盘自启的实例(直接、可靠)
+        KillHarness();
+        _harness = null;
+
+        // 2) 兜底: 用 netstat 找到真正监听该端口的 PID 并整树杀掉
+        //    (覆盖“接管外部实例”等 _ownsHarness 为 false 的情况)
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "netstat",
+                Arguments = "-ano",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using (var p = Process.Start(psi))
+            {
+                string outp = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(5000);
+                string portTag = ":" + port;
+                var pidSet = new HashSet<int>();
+                foreach (var line in outp.Split('\n'))
+                {
+                    // 只认 LISTENING 的本地监听行
+                    if (line.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (line.IndexOf(portTag, StringComparison.Ordinal) < 0) continue;
+                    var tok = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (tok.Length < 5) continue;
+                    int pid;
+                    if (int.TryParse(tok[tok.Length - 1], out pid) && pid > 0 && pid != Process.GetCurrentProcess().Id)
+                        pidSet.Add(pid);
+                }
+                foreach (var pid in pidSet)
+                {
+                    try
+                    {
+                        using (var killer = new Process())
+                        {
+                            ProcessStartInfo ki = new ProcessStartInfo
+                            {
+                                FileName = "taskkill",
+                                UseShellExecute = false,
+                                CreateNoWindow = true,
+                                Arguments = "/PID " + pid + " /T /F"
+                            };
+                            killer.StartInfo = ki;
+                            killer.Start();
+                            killer.WaitForExit(3000);
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
+
+        // 3) 等待端口真正释放, 避免 npm 安装仍撞上文件锁
+        for (int i = 0; i < 20; i++)
+        {
+            if (!IsPortListening(port)) break;
+            Thread.Sleep(200);
+        }
     }
 
     // 隐藏窗体: 让消息循环存在且进程可见于任务管理器, 但不显示窗口
